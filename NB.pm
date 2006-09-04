@@ -1,14 +1,13 @@
 package Net::IMAP::Simple::NB;
 
-our $VERSION = '1.0';
+our $VERSION = '1.1';
 
 use strict;
 use warnings;
 
-use base qw(Danga::Socket Net::IMAP::Simple);
+no warnings 'deprecated';
 
-use IO::File;
-use IO::Socket;
+use base qw(Danga::Socket Net::IMAP::Simple);
 
 =head1 NAME
 
@@ -102,8 +101,6 @@ B<OPTIONS:>
                   -> select cache result live before running
                   -> select() again.
 
-=it
-
 =cut
 
 use constant CLEANUP_TIME => 5; # every N seconds
@@ -135,6 +132,7 @@ use fields qw(
     last
     working_box
     _errstr
+    read_bytes
     );
 
 sub new {
@@ -157,6 +155,11 @@ sub new {
     $self->{line} = '';
     $self->{create_time} = $self->{alive_time} = time;
 
+    # Pop the port off the address string if it's not an IPv6 IP address
+    if(!$self->{use_v6} && $self->{server} =~ /^[A-Fa-f0-9]{4}:[A-Fa-f0-9]{4}:/ && $self->{server} =~ s/:(\d+)$//g){
+        $self->{port} = $1;
+    }
+    
     my $sock = $self->_connect;
     if(!$sock){
         $! =~ s/IO::Socket::INET6?: //g;
@@ -198,28 +201,61 @@ sub process_response_line {
     my Net::IMAP::Simple::NB $self = shift;
     my $line = shift;
     
-    my $ok = $self->_cmd_ok($line);
-    if ($ok) {
-        $self->{current_command} = undef;
-        return $self->{current_callback}->($self->{command_final}->($line));
+    #print "S: $line";
+
+    if ($self->{read_bytes}) {
+        $self->{read_bytes} -= bytelength($line);
+        $self->{read_bytes} = 0 if $self->{read_bytes} < 0;
+        $self->{command_process}->($line);
     }
-    elsif (defined($ok)) { # $ok is false here
-        $self->{current_command} = undef;
-        return $self->{current_callback}->();
+    elsif ($line =~ /^\*.*\{(\d+)\}$/ ) {
+        my $bytes = $1;
+        $self->{read_bytes} = $1;
+        $self->{command_process}->($line);
     }
     else {
-        $self->{command_process}->($line) if $self->{command_process};
+        my $ok = $self->_cmd_ok($line);
+        if ($ok) {
+            $self->{current_command} = undef;
+            return $self->{current_callback}->($self->{command_final}->($line));
+        }
+        elsif (defined($ok)) { # $ok is false here
+            $self->{current_command} = undef;
+            return $self->{current_callback}->();
+        }
+        else {
+            $self->{command_process}->($line) if $self->{command_process};
+        }
     }
 }
 
+sub _send_cmd {
+    my Net::IMAP::Simple::NB $self = shift;
+    my ( $name, $value ) = @_;
+    my $id   = $self->_nextid;
+    my $cmd  = "$id $name" . ($value ? " $value" : "") . "\r\n";
+    #print "C: $cmd";
+    $self->write($cmd);
+}
+
+sub _process_cmd {
+    my Net::IMAP::Simple::NB $self = shift;
+    my (%args) = @_;
+    die "Command currently in progress: $self->{current_command}\n" if $self->{current_command};
+    $self->{command_final} = $args{final} || die "No final calling $args{cmd}";
+    $self->{command_process} = $args{process} || die "No process calling $args{cmd}";
+    $self->_send_cmd(@{$args{cmd}});
+    $self->{current_command} = $args{cmd};
+}
+
+use Carp qw(confess);
 sub set_callback {
     my Net::IMAP::Simple::NB $self = shift;
-    $self->{current_callback} = shift;
+    $self->{current_callback} = shift || confess "set_callback called with no callback";
 }
 
 sub login { my $self = shift; $self->set_callback(pop); $self->SUPER::login(@_); }
 sub messages {my $self = shift; $self->set_callback(pop); $self->SUPER::messages(@_) }
-sub current_box {my $self = shift; $self->set_callback(pop); $self->SUPER::current_box(@_) }
 sub top {my $self = shift; $self->set_callback(pop); $self->SUPER::top(@_) }
 sub seen {my $self = shift; $self->set_callback(pop); $self->SUPER::seen(@_) }
 sub list {my $self = shift; $self->set_callback(pop); $self->SUPER::list(@_) }
@@ -227,11 +263,8 @@ sub get {my $self = shift; $self->set_callback(pop); $self->SUPER::get(@_) }
 sub getfh {my $self = shift; $self->set_callback(pop); $self->SUPER::getfh(@_) }
 sub delete {my $self = shift; $self->set_callback(pop); $self->SUPER::delete(@_) }
 sub create_mailbox {my $self = shift; $self->set_callback(pop); $self->SUPER::create_mailbox(@_) }
-sub expunge_mailbox {my $self = shift; $self->set_callback(pop); $self->SUPER::expunge_mailbox(@_) }
 sub delete_mailbox {my $self = shift; $self->set_callback(pop); $self->SUPER::delete_mailbox(@_) }
 sub rename_mailbox {my $self = shift; $self->set_callback(pop); $self->SUPER::rename_mailbox(@_) }
-sub folder_subscribe {my $self = shift; $self->set_callback(pop); $self->SUPER::folder_subscribe(@_) }
-sub folder_unsubscribe {my $self = shift; $self->set_callback(pop); $self->SUPER::folder_unsubscribe(@_) }
 sub copy {my $self = shift; $self->set_callback(pop); $self->SUPER::copy(@_) }
 
 
@@ -245,6 +278,8 @@ sub select {
     $mbox = 'INBOX' unless $mbox;
     
     $self->{working_box} = $mbox;
+    
+    $self->{BOXES}->{ $mbox }->{proc_time} ||= 0;
     
     if($self->{use_select_cache} && (time - $self->{BOXES}->{ $mbox }->{proc_time}) <= $self->{select_cache_ttl}){
         return $self->{BOXES}->{$mbox}->{messages};
@@ -284,21 +319,125 @@ sub select {
     );
 }
 
+sub unread {
+    my ( $self ) = @_;
+    $self->set_callback(pop);
+    
+    my @list;
+    $self->_process_cmd(
+        cmd     => [SEARCH => qq[UNSEEN]],
+        final   => sub { \@list },
+        process => sub {
+            if ($_[0] =~ /\* SEARCH (.*)$/) {
+                push @list, split(/\s+/, $1);
+            }
+        },
+    );
+}
+
+sub message_info {
+    my ( $self, $number ) = @_;
+    $self->set_callback(pop);
+    
+    my %flags;
+    my @lines;
+    $self->_process_cmd(
+        cmd     => [FETCH => qq[$number (FLAGS INTERNALDATE RFC822.HEADER)]],
+        final   => sub { \%flags, \@lines },
+        process => sub {
+            if (%flags) {
+                push @lines, $_[0];
+            }
+            else {
+                $_ = shift;
+                if (/\bFLAGS \((.*?)\)/) {
+                    $flags{$_}++ for split(/\s+/, $1);
+                }
+                if (/\bINTERNALDATE "(\d\d-[a-zA-Z]{3}-\d{4} \d\d:\d\d:\d\d [\+\-]\d{4})"/) {
+                    $flags{DATE} = $1;
+                }
+            }
+        },
+    );
+}
+
+sub message {
+    my ( $self, $number ) = @_;
+    $self->set_callback(pop);
+    
+    my %flags;
+    my @lines;
+    $self->_process_cmd(
+        cmd     => [FETCH => qq[$number (FLAGS INTERNALDATE RFC822)]],
+        final   => sub { \%flags, \@lines },
+        process => sub {
+            if (%flags) {
+                push @lines, $_[0];
+            }
+            else {
+                if (/\bFLAGS (\(.*?\))/) {
+                    $flags{$_}++ for split(/\s+/, $1);
+                }
+                if (/\bINTERNALDATE "(\d\d-[a-zA-Z]{3}-\d{4} \d\d:\d\d:\d\d [\+\-]\d{4})"/) {
+                    $flags{DATE} = $1;
+                }
+            }
+        },
+    );
+}
+
 sub flags {
     my Net::IMAP::Simple::NB $self = shift;
-    $self->set_callback(pop);
+    my $cb = pop;
     my $folder = shift;
     
-    $self->select($folder, sub { @{ $self->{BOXES}->{ $self->current_box }->{flags} } } );
+    $self->select($folder, sub { @{ $self->{BOXES}->{ $self->current_box }->{flags} } }, $cb );
 }
 
 
 sub recent {
     my Net::IMAP::Simple::NB $self = shift;
-    $self->set_callback(pop);
+    my $cb = pop;
     my $folder = shift;
     
-    $self->select($folder, sub { $self->{BOXES}->{ $self->current_box }->{recent} } );
+    $self->select($folder, sub { $self->{BOXES}->{ $self->current_box }->{recent} }, $cb );
+}
+
+sub expunge_mailbox {
+    my Net::IMAP::Simple::NB $self = shift;
+    my $cb = pop;
+    my $box = shift;
+    $self->select($box, sub {
+        $self->_process_cmd(
+            cmd     => ['EXPUNGE'],
+            final   => sub { 1 },
+            process => sub { },
+        );
+    }, $cb);
+}
+
+sub folder_subscribe {
+    my ($self, $box) = @_;
+    my $cb = pop;
+    $self->select($box, sub {
+        $self->_process_cmd(
+            cmd     => [SUBSCRIBE => _escape($box)],
+            final   => sub { 1 },
+            process => sub { },
+        );
+    }, $cb);
+}
+
+sub folder_unsubscribe {
+    my ($self, $box) = @_;
+    my $cb = pop;
+    $self->select($box, sub {
+        $self->_process_cmd(
+            cmd     => [UNSUBSCRIBE => _escape($box)],
+            final   => sub { 1 },
+            process => sub { },
+        );
+    }, $cb);
 }
 
 sub quit {
@@ -319,71 +458,66 @@ sub quit {
 
 sub mailboxes {
     my Net::IMAP::Simple::NB $self = shift;
+    $self->_mailboxes('LIST', @_);
+}
+
+sub mailboxes_subscribed {
+    my Net::IMAP::Simple::NB $self = shift;
+    $self->_mailboxes('LSUB', @_);
+}
+
+sub _mailboxes {
+    my Net::IMAP::Simple::NB $self = shift;
     $self->set_callback(pop);
-    my ( $box, $ref ) = @_;
+    my ( $type, $box, $ref ) = @_;
     
     $ref ||= '""';
     my @list;
     my $mode = 'listcheck';
-    if ( ! defined $box ) {
-        # recurse, should probably follow
-        # RFC 2683: 3.2.1.1.  Listing Mailboxes
-        return $self->_process_cmd(
-            cmd     => [LIST => qq[$ref *]],
-            final   => sub { _unescape($_) for @list; @list },
-            process => sub {
-                my $line = shift;
-                if ($mode eq 'listcheck') {
-                    if ( $line =~ /^\*\s+LIST.*\s+(\".*?\")\s*$/i ||
-                         $line =~ /^\*\s+LIST.*\s+(\S+)\s*$/i )
-                    {
-                        push @list, $1;
-                    }
-                    elsif ( $line =~ /^\*\s+LIST.*\s+\{\d+\}\s*$/i ) {
-                        $mode = 'listextra';
-                    }
-                }
-                elsif ($mode eq 'listextra') {
-                    chomp($line);
-                    $line =~ s/\r//;
-                    _escape($line);
-                    push @list, $line;
-                    $mode = 'listcheck';
-                }
-            },
-        );
-    } else {
-        return $self->_process_cmd(
-            cmd     => [LIST => qq[$ref $box]],
-            final   => sub { _unescape($_) for @list; @list },
-            process => sub {
-                my $line = shift;
-                if ($mode eq 'listcheck') {
-                    if ( $line =~ /^\*\s+LIST.*\s+(\".*?\")\s*$/i ||
-                         $line =~ /^\*\s+LIST.*\s+(\S+)\s*$/i )
-                    {
-                        push @list, $1;
-                    }
-                    elsif ( $line =~ /^\*\s+LIST.*\s+\{\d+\}\s*$/i ) {
-                        $mode = 'listextra';
-                    }
-                }
-                elsif ($mode eq 'listextra') {
-                    chomp($line);
-                    $line =~ s/\r//;
-                    _escape($line);
-                    push @list, $line;
-                    $mode = 'listcheck';
-                }
-            },
-        );
+    my $query = [$type => qq[$ref *]];
+    if ( defined $box ) {
+        my $query = [$type => qq[$ref $box]];
     }
+    
+    # recurse, should probably follow
+    # RFC 2683: 3.2.1.1.  Listing Mailboxes
+    return $self->_process_cmd(
+        cmd     => $query,
+        final   => sub { _unescape($_) for @list; @list },
+        process => sub {
+            my $line = shift;
+            # * LIST (\Unmarked \HasNoChildren) "." "INBOX.web_board"
+            if ($mode eq 'listcheck') {
+                if ( $line =~ /^\*\s+(LIST|LSUB).*\s+(\".*?\")\s*$/i ||
+                     $line =~ /^\*\s+(LIST|LSUB).*\s+(\S+)\s*$/i )
+                {
+                    push @list, $2;
+                }
+                elsif ( $line =~ /^\*\s+(LIST|LSUB).*\s+\{\d+\}\s*$/i ) {
+                    $mode = 'listextra';
+                }
+            }
+            elsif ($mode eq 'listextra') {
+                chomp($line);
+                $line =~ s/\r//;
+                _escape($line);
+                push @list, $line;
+                $mode = 'listcheck';
+            }
+        },
+    );
+}
+
+sub bytelength {
+    use bytes;
+    return length($_[0]);
 }
 
 sub _escape {
     $_[0] =~ s/\\/\\\\/g;
     $_[0] =~ s/\"/\\\"/g;
     $_[0] = "\"$_[0]\"";
+    $_[0];
 }
 
 sub _unescape {
@@ -391,25 +525,6 @@ sub _unescape {
     $_[0] =~ s/"$//g;
     $_[0] =~ s/\\\"/\"/g;
     $_[0] =~ s/\\\\/\\/g;
-}
-
-sub _send_cmd {
-    my Net::IMAP::Simple::NB $self = shift;
-    my ( $name, $value ) = @_;
-    my $id   = $self->_nextid;
-    my $cmd  = "$id $name" . ($value ? " $value" : "") . "\r\n";
-    # print "CMD: $cmd";
-    $self->write($cmd);
-}
-
-sub _process_cmd {
-    my Net::IMAP::Simple::NB $self = shift;
-    my (%args) = @_;
-    die "Command currently in progress: $self->{current_command}\n" if $self->{current_command};
-    $self->{command_final} = $args{final};
-    $self->{command_process} = $args{process};
-    $self->_send_cmd(@{$args{cmd}});
-    $self->{current_command} = $args{cmd};
 }
 
 Danga::Socket->AddTimer(CLEANUP_TIME, \&_do_cleanup);
